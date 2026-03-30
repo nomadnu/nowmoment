@@ -17,9 +17,12 @@ HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
 }
 
+# ──────────────────────────────────────────────
+# 헬스체크
+# ──────────────────────────────────────────────
 @app.route("/")
 def health():
-    return jsonify({"status": "ok", "service": "UTIC CCTV Proxy v5"})
+    return jsonify({"status": "ok", "service": "UTIC CCTV Proxy v6"})
 
 @app.route("/myip")
 def myip():
@@ -30,132 +33,127 @@ def myip():
         return jsonify({"error": str(e)}), 500
 
 # ──────────────────────────────────────────────
-# JS 전체에서 KB/KBS 관련 함수 찾기
+# CCTV ID로 상세 정보 조회
+# GET /utic/info?cctvId=L904028
 # ──────────────────────────────────────────────
-@app.route("/utic/kb_full")
-def kb_full():
+@app.route("/utic/info")
+def utic_info():
+    cctv_id = request.args.get("cctvId", "")
+    if not cctv_id:
+        return jsonify({"error": "cctvId 파라미터 필요"}), 400
     try:
         resp = requests.get(
-            f"{BASE_URL}/js/openDataCctvStream.js",
-            headers=HEADERS, timeout=10
+            f"{BASE_URL}/map/getCctvInfoById.do",
+            params={"cctvId": cctv_id},
+            headers=HEADERS,
+            timeout=10
         )
-        text = resp.text
-
-        # KB 또는 cctvPlay_K 함수 주변 코드 추출
-        # 함수 이름 패턴: cctvPlay_KB, cctvPlay_K, KIND == 'KB'
-        patterns = [
-            r'KB',
-            r'cctvPlay_K[B]?',
-            r"KIND.*KB",
-            r"'KB'",
-            r'"KB"',
-            r'kbs',
-            r'KBS',
-            r'disaster',
-            r'news\.kbs',
-        ]
-
-        found = {}
-        for pat in patterns:
-            matches = [(m.start(), text[max(0,m.start()-100):m.start()+300])
-                      for m in re.finditer(pat, text, re.IGNORECASE)]
-            if matches:
-                found[pat] = [m[1] for m in matches[:5]]
-
-        # cctvPlay_ 함수 목록 전체 추출
-        play_funcs = re.findall(
-            r'this\.cctvPlay_(\w+)\s*=\s*function', text)
-
+        try:
+            data = resp.json()
+        except Exception:
+            data = None
         return jsonify({
-            "play_functions": play_funcs,
-            "kb_matches":     found,
-            "js_length":      len(text),
+            "status":       resp.status_code,
+            "content_type": resp.headers.get("Content-Type", ""),
+            "data":         data,
+            "raw":          resp.text[:500] if not data else None,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ──────────────────────────────────────────────
-# UTIC 팝업 페이지에서 실제 스트림 URL 추출
-# CCTV 클릭 시 열리는 팝업 페이지 분석
+# 여러 CCTV ID 한꺼번에 조회
+# GET /utic/batch?ids=L904028,L904029,L933092
 # ──────────────────────────────────────────────
-@app.route("/utic/popup")
-def utic_popup():
-    cctv_id = request.args.get("cctvId", "L933092")
+@app.route("/utic/batch")
+def utic_batch():
+    ids_str = request.args.get("ids", "")
+    if not ids_str:
+        return jsonify({"error": "ids 파라미터 필요 (쉼표 구분)"}), 400
 
-    popup_urls = [
-        f"{BASE_URL}/map/popupCctvStream.do?cctvId={cctv_id}",
-        f"{BASE_URL}/map/cctvPopup.do?cctvId={cctv_id}",
-        f"{BASE_URL}/guide/cctvStream.do?cctvId={cctv_id}&key={UTIC_KEY}",
-        f"{BASE_URL}/guide/popupCctv.do?cctvId={cctv_id}&key={UTIC_KEY}",
-    ]
+    cctv_ids = [i.strip() for i in ids_str.split(",") if i.strip()]
+    results  = []
 
-    results = []
-    for url in popup_urls:
+    for cctv_id in cctv_ids[:20]:  # 최대 20개
         try:
-            resp = requests.get(url, headers={
-                **HEADERS, "Accept": "text/html"}, timeout=8)
-            # URL이나 스트림 관련 내용 추출
-            body = resp.text
-            urls_in_body = re.findall(
-                r'(?:http[s]?://[^\s\'"<>]+(?:m3u8|rtmp|rtsp|stream)[^\s\'"<>]*)',
-                body, re.IGNORECASE)
-            results.append({
-                "url":          url,
-                "status":       resp.status_code,
-                "ct":           resp.headers.get("Content-Type",""),
-                "stream_urls":  urls_in_body,
-                "body_preview": body[:400],
-            })
+            resp = requests.get(
+                f"{BASE_URL}/map/getCctvInfoById.do",
+                params={"cctvId": cctv_id},
+                headers=HEADERS,
+                timeout=10
+            )
+            try:
+                data = resp.json()
+            except Exception:
+                data = {"raw": resp.text[:200]}
+            results.append({"cctvId": cctv_id, "data": data})
         except Exception as e:
-            results.append({"url": url, "error": str(e)})
+            results.append({"cctvId": cctv_id, "error": str(e)})
 
     return jsonify(results)
 
 # ──────────────────────────────────────────────
-# KBS 재난포털 CCTV 스트림 직접 테스트
-# STRMID와 CCTVIP(포트)로 다양한 패턴 시도
+# CCTV ID → 스트림 URL 생성
+# CCTVIP와 스트림 서버 주소로 HLS URL 조합
+# GET /utic/stream?cctvId=L904028
 # ──────────────────────────────────────────────
-@app.route("/kbs/probe")
-def kbs_probe():
-    strm_id = request.args.get("strmId", "L933092")
-    port    = request.args.get("port",   "9983")    # CCTVIP 값
+@app.route("/utic/stream")
+def utic_stream():
+    cctv_id = request.args.get("cctvId", "")
+    if not cctv_id:
+        return jsonify({"error": "cctvId 파라미터 필요"}), 400
 
-    # KBS 재난포털이 사용하는 알려진 스트리밍 서버들
-    candidates = [
-        # KBS CDN 패턴
-        f"https://news.kbs.co.kr/special/emergency/2020/earthquake/cctv/{strm_id}.m3u8",
-        f"http://cctv.kbs.co.kr/stream/{strm_id}.m3u8",
-        f"http://kbscctv.kbs.co.kr/{strm_id}/{strm_id}.m3u8",
-        # 포트 기반 패턴
-        f"rtmp://streaming.kbs.co.kr:{port}/live/{strm_id}",
-        # UTIC 자체 스트리밍
-        f"http://streaming.utic.go.kr/live/{strm_id}.m3u8",
-        f"http://stream.utic.go.kr/{strm_id}.m3u8",
-        # 공공 재난 스트리밍
-        f"http://cctv.safekorea.go.kr/stream/{strm_id}.m3u8",
-    ]
+    try:
+        # CCTV 정보 조회
+        resp = requests.get(
+            f"{BASE_URL}/map/getCctvInfoById.do",
+            params={"cctvId": cctv_id},
+            headers=HEADERS,
+            timeout=10
+        )
+        data = resp.json()
 
-    results = []
-    for url in candidates:
-        if url.startswith("rtmp"):
-            results.append({"url": url, "note": "RTMP - 앱에서 미지원"})
-            continue
-        try:
-            resp = requests.head(url, timeout=5, allow_redirects=True)
-            results.append({
-                "url":    url,
-                "status": resp.status_code,
-                "ct":     resp.headers.get("Content-Type", ""),
-            })
-        except Exception as e:
-            results.append({"url": url, "error": str(e[:100])})
+        cctvip   = str(data.get("CCTVIP", ""))
+        kind     = data.get("KIND", "")
+        strm_id  = data.get("STRMID", cctv_id)
+        movie    = data.get("MOVIE", "N")
 
-    return jsonify({"strmId": strm_id, "port": port, "results": results})
+        # 확인된 스트림 URL 패턴
+        # http://637bef0325205.streamlock.net/live/cctv20.stream/playlist.m3u8
+        # CCTVIP = 숫자 → cctv{숫자}.stream 패턴 가능성
+        stream_url = None
+
+        if movie == "Y" and cctvip:
+            # 패턴 1: streamlock.net (강릉시 확인됨)
+            candidate = (f"http://637bef0325205.streamlock.net/live/"
+                        f"cctv{cctvip}.stream/playlist.m3u8")
+
+            # HEAD 요청으로 URL 유효성 확인
+            try:
+                check = requests.head(candidate, timeout=5)
+                if check.status_code == 200:
+                    stream_url = candidate
+            except Exception:
+                pass
+
+        return jsonify({
+            "cctvId":    cctv_id,
+            "kind":      kind,
+            "cctvip":    cctvip,
+            "strmId":    strm_id,
+            "movie":     movie,
+            "streamUrl": stream_url,
+            "candidate": (f"http://637bef0325205.streamlock.net/live/"
+                         f"cctv{cctvip}.stream/playlist.m3u8") if cctvip else None,
+            "rawData":   data,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ──────────────────────────────────────────────
-# 앱에서 사용할 최종 CCTV 엔드포인트
-# 위경도 기반으로 CCTV 목록 + 스트림 URL 반환
-# GET /api/cctv?lat=37.53&lng=126.92
+# 앱에서 사용할 최종 엔드포인트
+# 위경도 기반 근처 CCTV + 스트림 URL 반환
+# GET /api/cctv?lat=37.79&lng=128.89&radius=5
 # ──────────────────────────────────────────────
 @app.route("/api/cctv")
 def api_cctv():
