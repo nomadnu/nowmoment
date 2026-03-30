@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request
 import requests
 import re
 import threading
@@ -14,7 +14,7 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
                   "Chrome/120.0.0.0 Safari/537.36",
-    "Referer": BASE_URL,
+    "Referer": f"{BASE_URL}/guide/cctvOpenData.do?key={UTIC_KEY}",
     "Accept": "text/html,application/xhtml+xml,*/*",
 }
 HEADERS_AJAX = {
@@ -32,7 +32,7 @@ _crawl_status = {
 @app.route("/")
 def health():
     return jsonify({
-        "status": "ok", "service": "UTIC CCTV Proxy v10",
+        "status": "ok", "service": "UTIC CCTV Proxy v11",
         "cached": len(_stream_cache), "crawl": _crawl_status,
     })
 
@@ -45,126 +45,73 @@ def myip():
         return jsonify({"error": str(e)}), 500
 
 # ──────────────────────────────────────────────
-# cctvStream.js 분석 (URL 조합 방식 파악)
-# GET /utic/js
+# KIND별 스트림 URL 내부 API 매핑
+# HTML 소스에서 발견한 실제 엔드포인트들
 # ──────────────────────────────────────────────
-@app.route("/utic/js")
-def utic_js():
+def get_stream_url(data: dict) -> str:
+    if data.get("MOVIE") != "Y":
+        return ""
+
+    kind    = data.get("KIND", "")
+    cctvip  = str(data.get("CCTVIP", ""))
+    cctv_id = data.get("CCTVID", "")
+    name    = data.get("CCTVNAME", "")
+
+    # KB(KBS 재난포털), A(서울 ActiveX) 스킵
+    if kind in ("KB", "A"):
+        return ""
+
+    # ── EE/KB: 경기도 교통정보센터 방식 ──────────
+    # /map/getGyeonggiCctvUrl.do?cctvIp={cctvip}
+    if "EE" in kind or "KB" in kind:
+        url = _call_internal_api(
+            f"{BASE_URL}/map/getGyeonggiCctvUrl.do?cctvIp={cctvip}")
+        if url:
+            return url
+
+    # ── EEE: ITS 기반 경기도 ──────────────────────
+    if "EEE" in kind:
+        url = _call_internal_api(
+            f"{BASE_URL}/map/getGyeonggiCctvUrlFromIts.do?cctvIp={cctvip}")
+        if url:
+            return url
+
+    # ── 기타: 팝업 HTML에서 직접 추출 ─────────────
+    return _fetch_from_popup(cctv_id, kind, cctvip, name)
+
+
+def _call_internal_api(url: str) -> str:
+    """UTIC 내부 API 호출 → 스트림 URL 반환"""
     try:
-        resp = requests.get(
-            f"{BASE_URL}/js/cctvStream.js?ver=2.3",
-            headers=HEADERS, timeout=10
-        )
-        text = resp.text
-        # cctvsec, ktict, m3u8, mp4, stream 관련 라인 추출
-        lines = text.split('\n')
-        relevant = [l.strip() for l in lines
-                    if any(k in l for k in [
-                        'cctvsec', 'ktict', 'm3u8', 'mp4',
-                        'stream', 'http', 'playlist',
-                        'wmsAuth', 'nimble', 'EE',
-                    ])]
-        return jsonify({
-            "length":   len(text),
-            "relevant": relevant[:80],
-            "preview":  text[:2000],
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        resp = requests.get(url, headers=HEADERS_AJAX, timeout=8)
+        if resp.status_code != 200:
+            return ""
+        text = resp.text.strip()
+        # "null" 또는 빈값이면 스킵
+        if not text or text == "null" or text == '"null"':
+            return ""
+        # JSON 문자열인 경우 파싱
+        import json
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, str):
+                return parsed if parsed.startswith("http") else ""
+            if isinstance(parsed, dict):
+                for key in ["url", "cctvurl", "streamUrl", "data"]:
+                    val = parsed.get(key, "")
+                    if val and str(val).startswith("http"):
+                        return str(val)
+        except Exception:
+            # 순수 URL 문자열인 경우
+            if text.startswith("http"):
+                return text
+        return ""
+    except Exception:
+        return ""
 
-# ──────────────────────────────────────────────
-# 팝업 HTML 전체 반환 (평문)
-# GET /utic/html?cctvId=L904028
-# ──────────────────────────────────────────────
-@app.route("/utic/html")
-def utic_html():
-    cctv_id = request.args.get("cctvId", "L904028")
-    try:
-        info_resp = requests.get(
-            f"{BASE_URL}/map/getCctvInfoById.do",
-            params={"cctvId": cctv_id},
-            headers=HEADERS_AJAX, timeout=10
-        )
-        data   = info_resp.json()
-        kind   = data.get("KIND", "")
-        cctvip = str(data.get("CCTVIP", ""))
-        name   = data.get("CCTVNAME", "")
 
-        popup_url = (
-            f"{BASE_URL}/jsp/map/openDataCctvStream.jsp"
-            f"?key={UTIC_KEY}&cctvid={cctv_id}"
-            f"&cctvName={requests.utils.quote(name)}"
-            f"&kind={kind}&cctvip={cctvip}"
-            f"&cctvch=undefined&id=undefined"
-            f"&cctvpasswd=undefined&cctvport=undefined"
-        )
-        popup_resp = requests.get(popup_url, headers=HEADERS, timeout=10)
-
-        # HTML 전체를 텍스트로 반환
-        return Response(
-            popup_resp.text,
-            content_type="text/plain; charset=utf-8"
-        )
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# ──────────────────────────────────────────────
-# 팝업 HTML에서 모든 URL 패턴 추출
-# GET /utic/popup?cctvId=L904028
-# ──────────────────────────────────────────────
-@app.route("/utic/popup")
-def utic_popup():
-    cctv_id = request.args.get("cctvId", "L904028")
-    try:
-        info_resp = requests.get(
-            f"{BASE_URL}/map/getCctvInfoById.do",
-            params={"cctvId": cctv_id},
-            headers=HEADERS_AJAX, timeout=10
-        )
-        data   = info_resp.json()
-        kind   = data.get("KIND", "")
-        cctvip = str(data.get("CCTVIP", ""))
-        name   = data.get("CCTVNAME", "")
-
-        popup_url = (
-            f"{BASE_URL}/jsp/map/openDataCctvStream.jsp"
-            f"?key={UTIC_KEY}&cctvid={cctv_id}"
-            f"&cctvName={requests.utils.quote(name)}"
-            f"&kind={kind}&cctvip={cctvip}"
-            f"&cctvch=undefined&id=undefined"
-            f"&cctvpasswd=undefined&cctvport=undefined"
-        )
-        popup_resp = requests.get(popup_url, headers=HEADERS, timeout=10)
-        html = popup_resp.text
-
-        # 모든 URL 패턴 추출
-        all_urls = re.findall(
-            r'(https?://[^\s\'"<>\\]+)', html, re.IGNORECASE)
-
-        # JS 변수 값 추출
-        js_vars = re.findall(
-            r'var\s+(\w+)\s*=\s*["\']([^"\']+)["\']', html)
-        js_assigns = re.findall(
-            r'(\w+)\s*=\s*["\']([^"\']*(?:http|stream|m3u8|mp4)[^"\']*)["\']',
-            html, re.IGNORECASE)
-
-        return jsonify({
-            "cctvId":     cctv_id,
-            "kind":       kind,
-            "cctvip":     cctvip,
-            "popup_url":  popup_url,
-            "all_urls":   list(set(all_urls))[:30],
-            "js_vars":    js_vars[:20],
-            "js_assigns": js_assigns[:20],
-            "html_len":   len(html),
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# ──────────────────────────────────────────────
-# 스트림 URL 추출 함수
-# ──────────────────────────────────────────────
-def _fetch_stream_from_popup(cctv_id, kind, cctvip, name="") -> str:
+def _fetch_from_popup(cctv_id, kind, cctvip, name="") -> str:
+    """팝업 JSP HTML에서 스트림 URL 추출"""
     try:
         popup_url = (
             f"{BASE_URL}/jsp/map/openDataCctvStream.jsp"
@@ -183,28 +130,14 @@ def _fetch_stream_from_popup(cctv_id, kind, cctvip, name="") -> str:
             r'(https?://cctvsec\.ktict\.co\.kr[^\s\'"<>\\]+)',
             r'(https?://[^\s\'"<>\\]+\.m3u8[^\s\'"<>\\]*)',
             r'(https?://[^\s\'"<>\\]+\.mp4[^\s\'"<>\\]*)',
-            r'(https?://[^\s\'"<>\\]+playlist[^\s\'"<>\\]*)',
         ]
         for pat in patterns:
             for m in re.findall(pat, html, re.IGNORECASE):
-                # undefined 포함된 URL 제외
                 if "undefined" not in m and len(m) > 20:
                     return m
         return ""
     except Exception:
         return ""
-
-
-def get_stream_url(data: dict) -> str:
-    if data.get("MOVIE") != "Y":
-        return ""
-    kind    = data.get("KIND", "")
-    cctv_id = data.get("CCTVID", "")
-    cctvip  = str(data.get("CCTVIP", ""))
-    name    = data.get("CCTVNAME", "")
-    if kind in ("KB", "A"):
-        return ""
-    return _fetch_stream_from_popup(cctv_id, kind, cctvip, name)
 
 
 # ──────────────────────────────────────────────
@@ -229,6 +162,31 @@ def utic_info():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ──────────────────────────────────────────────
+# 내부 API 직접 테스트
+# GET /utic/api?cctvIp=62086
+# ──────────────────────────────────────────────
+@app.route("/utic/api")
+def utic_api():
+    cctvip = request.args.get("cctvIp", "62086")
+    results = {}
+
+    for endpoint in [
+        f"{BASE_URL}/map/getGyeonggiCctvUrl.do?cctvIp={cctvip}",
+        f"{BASE_URL}/map/getGyeonggiCctvUrlFromIts.do?cctvIp={cctvip}",
+    ]:
+        try:
+            resp = requests.get(endpoint, headers=HEADERS_AJAX, timeout=8)
+            results[endpoint] = {
+                "status": resp.status_code,
+                "body":   resp.text[:500],
+            }
+        except Exception as e:
+            results[endpoint] = {"error": str(e)}
+
+    return jsonify(results)
 
 
 # ──────────────────────────────────────────────
