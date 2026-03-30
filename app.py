@@ -1,7 +1,7 @@
 from flask import Flask, jsonify, request, Response
 import requests
-import re
 import json
+import re
 
 app = Flask(__name__)
 
@@ -13,6 +13,8 @@ HEADERS = {
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
                   "Chrome/120.0.0.0 Safari/537.36",
     "Referer": BASE_URL,
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "X-Requested-With": "XMLHttpRequest",
 }
 
 # ──────────────────────────────────────────────
@@ -20,11 +22,8 @@ HEADERS = {
 # ──────────────────────────────────────────────
 @app.route("/")
 def health():
-    return jsonify({"status": "ok", "service": "UTIC CCTV Proxy v2"})
+    return jsonify({"status": "ok", "service": "UTIC CCTV Proxy v3"})
 
-# ──────────────────────────────────────────────
-# 이 서버의 아웃바운드 IP 확인
-# ──────────────────────────────────────────────
 @app.route("/myip")
 def myip():
     try:
@@ -34,124 +33,120 @@ def myip():
         return jsonify({"error": str(e)}), 500
 
 # ──────────────────────────────────────────────
-# UTIC JS 파일 분석 - 내부 API 엔드포인트 탐색
+# CCTV ID로 상세 정보 조회 (스트림 URL 포함 여부 확인)
+# GET /utic/info?cctvId=L933092
 # ──────────────────────────────────────────────
-@app.route("/utic/js")
-def utic_js():
+@app.route("/utic/info")
+def utic_info():
+    cctv_id = request.args.get("cctvId", "")
+    if not cctv_id:
+        return jsonify({"error": "cctvId 파라미터 필요"}), 400
+
     try:
         resp = requests.get(
-            f"{BASE_URL}/js/openDataCctvStream.js",
-            headers=HEADERS, timeout=10
+            f"{BASE_URL}/map/getCctvInfoById.do",
+            params={"cctvId": cctv_id},
+            headers=HEADERS,
+            timeout=10
         )
-        return Response(resp.text, content_type="text/plain; charset=utf-8")
+        ct = resp.headers.get("Content-Type", "")
+        return jsonify({
+            "status":       resp.status_code,
+            "content_type": ct,
+            "raw":          resp.text[:2000],
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ──────────────────────────────────────────────
-# UTIC CCTV 목록 조회 (여러 엔드포인트 시도)
-# GET /cctv?minX=126.9&maxX=127.1&minY=37.4&maxY=37.6
+# CCTV 목록 샘플 조회 (CSV의 첫 10개 ID 테스트)
+# GET /utic/sample
 # ──────────────────────────────────────────────
-@app.route("/cctv")
-def cctv():
-    min_x = request.args.get("minX", "")
-    max_x = request.args.get("maxX", "")
-    min_y = request.args.get("minY", "")
-    max_y = request.args.get("maxY", "")
-
-    # 시도할 UTIC 내부 API 엔드포인트 목록
-    endpoints = [
-        # 형식 1: JSON API
-        {
-            "url": f"{BASE_URL}/guide/getCctvList.do",
-            "params": {"key": UTIC_KEY, "type": "json",
-                       "minX": min_x, "maxX": max_x,
-                       "minY": min_y, "maxY": max_y},
-        },
-        # 형식 2: CCTV 스트림 목록
-        {
-            "url": f"{BASE_URL}/guide/cctvDataList.do",
-            "params": {"key": UTIC_KEY,
-                       "minX": min_x, "maxX": max_x,
-                       "minY": min_y, "maxY": max_y},
-        },
-        # 형식 3: openData Ajax
-        {
-            "url": f"{BASE_URL}/openData/getCctvList.do",
-            "params": {"key": UTIC_KEY, "type": "json",
-                       "minX": min_x, "maxX": max_x,
-                       "minY": min_y, "maxY": max_y},
-        },
-        # 형식 4: utis CCTV API
-        {
-            "url": f"{BASE_URL}/utic/getCctvList.do",
-            "params": {"key": UTIC_KEY,
-                       "minX": min_x, "maxX": max_x,
-                       "minY": min_y, "maxY": max_y},
-        },
-        # 형식 5: 키만 파라미터
-        {
-            "url": f"{BASE_URL}/guide/cctvOpenData.do",
-            "params": {"key": UTIC_KEY, "type": "json",
-                       "minX": min_x, "maxX": max_x,
-                       "minY": min_y, "maxY": max_y},
-        },
+@app.route("/utic/sample")
+def utic_sample():
+    # CSV에 있는 샘플 CCTV ID 목록 (실제 데이터)
+    sample_ids = [
+        "L933092", "L933065", "L933061", "L933062", "L933102",
+        "L933101", "L933066", "L933096", "L933090", "L933097",
     ]
 
     results = []
-    for ep in endpoints:
+    for cctv_id in sample_ids:
         try:
             resp = requests.get(
-                ep["url"],
-                params={k: v for k, v in ep["params"].items() if v},
+                f"{BASE_URL}/map/getCctvInfoById.do",
+                params={"cctvId": cctv_id},
                 headers=HEADERS,
                 timeout=10
             )
             ct = resp.headers.get("Content-Type", "")
+
+            # JSON 파싱 시도
+            data = None
+            try:
+                data = resp.json()
+            except Exception:
+                pass
+
             results.append({
-                "url":          ep["url"],
+                "cctvId":       cctv_id,
                 "status":       resp.status_code,
                 "content_type": ct,
-                "preview":      resp.text[:300],
+                "data":         data,
+                "raw":          resp.text[:500] if not data else None,
             })
         except Exception as e:
-            results.append({"url": ep["url"], "error": str(e)})
+            results.append({"cctvId": cctv_id, "error": str(e)})
 
     return jsonify(results)
 
 # ──────────────────────────────────────────────
-# UTIC 원본 HTML 페이지에서 AJAX URL 파싱
+# UTIC CCTV 전체 목록에서 스트림 가능한 URL 추출
+# GET /utic/stream?cctvId=L933092
 # ──────────────────────────────────────────────
-@app.route("/utic/parse")
-def utic_parse():
+@app.route("/utic/stream")
+def utic_stream():
+    cctv_id = request.args.get("cctvId", "")
+    if not cctv_id:
+        return jsonify({"error": "cctvId 필요"}), 400
+
     try:
-        # 원본 페이지 로드
         resp = requests.get(
-            f"{BASE_URL}/guide/cctvOpenData.do",
-            params={"key": UTIC_KEY},
+            f"{BASE_URL}/map/getCctvInfoById.do",
+            params={"cctvId": cctv_id},
             headers=HEADERS,
-            timeout=15
+            timeout=10
         )
-        html = resp.text
 
-        # JS 파일에서 Ajax URL 패턴 추출
-        js_resp = requests.get(
-            f"{BASE_URL}/js/openDataCctvStream.js",
-            headers=HEADERS, timeout=10
-        )
-        js_text = js_resp.text
+        try:
+            data = resp.json()
+        except Exception:
+            return jsonify({
+                "cctvId":   cctv_id,
+                "hasUrl":   False,
+                "raw":      resp.text[:500],
+                "message":  "JSON 파싱 실패",
+            })
 
-        # URL 패턴 찾기
-        url_patterns = re.findall(r'["\']([^"\']*\.do[^"\']*)["\']', js_text)
-        ajax_urls    = re.findall(r'url\s*:\s*["\']([^"\']+)["\']', js_text)
-        fetch_urls   = re.findall(
-            r'(?:fetch|ajax|get|post)\s*\(\s*["\']([^"\']+)["\']', js_text)
+        # 스트림 URL 필드 탐색
+        stream_url = None
+        url_fields = ["CCTVURL", "cctvurl", "streamUrl", "STREAMURL",
+                      "url", "URL", "LIVEURL", "liveurl"]
+
+        if isinstance(data, dict):
+            for field in url_fields:
+                val = data.get(field, "")
+                if val and val.startswith("http"):
+                    stream_url = val
+                    break
 
         return jsonify({
-            "url_patterns": url_patterns[:30],
-            "ajax_urls":    ajax_urls[:20],
-            "fetch_urls":   fetch_urls[:20],
-            "js_preview":   js_text[:1000],
+            "cctvId":    cctv_id,
+            "hasUrl":    stream_url is not None,
+            "streamUrl": stream_url,
+            "allFields": data if isinstance(data, dict) else None,
         })
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
