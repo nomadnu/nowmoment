@@ -4,6 +4,7 @@ import re
 import threading
 import time
 import math
+import json
 
 app = Flask(__name__)
 
@@ -32,7 +33,7 @@ _crawl_status = {
 @app.route("/")
 def health():
     return jsonify({
-        "status": "ok", "service": "UTIC CCTV Proxy v11",
+        "status": "ok", "service": "UTIC CCTV Proxy v12",
         "cached": len(_stream_cache), "crawl": _crawl_status,
     })
 
@@ -45,8 +46,51 @@ def myip():
         return jsonify({"error": str(e)}), 500
 
 # ──────────────────────────────────────────────
-# KIND별 스트림 URL 내부 API 매핑
-# HTML 소스에서 발견한 실제 엔드포인트들
+# URL 정규화: // → http://, 공백/개행 제거
+# ──────────────────────────────────────────────
+def _normalize_url(raw: str) -> str:
+    url = raw.strip()
+    if not url or url == "null":
+        return ""
+    # 프로토콜 상대 URL 처리: //cctvsec... → http://cctvsec...
+    if url.startswith("//"):
+        url = "http:" + url
+    # http로 시작하지 않으면 무효
+    if not url.startswith("http"):
+        return ""
+    return url
+
+# ──────────────────────────────────────────────
+# UTIC 내부 API 호출
+# ──────────────────────────────────────────────
+def _call_internal_api(url: str) -> str:
+    try:
+        resp = requests.get(url, headers=HEADERS_AJAX, timeout=8)
+        if resp.status_code != 200:
+            return ""
+        text = resp.text.strip()
+        if not text or text in ("null", '"null"'):
+            return ""
+        # JSON 파싱 시도
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, str):
+                return _normalize_url(parsed)
+            if isinstance(parsed, dict):
+                for key in ["url", "cctvurl", "streamUrl", "data"]:
+                    val = str(parsed.get(key, ""))
+                    normalized = _normalize_url(val)
+                    if normalized:
+                        return normalized
+        except Exception:
+            pass
+        # 순수 URL 문자열
+        return _normalize_url(text)
+    except Exception:
+        return ""
+
+# ──────────────────────────────────────────────
+# KIND별 스트림 URL 조회
 # ──────────────────────────────────────────────
 def get_stream_url(data: dict) -> str:
     if data.get("MOVIE") != "Y":
@@ -61,57 +105,22 @@ def get_stream_url(data: dict) -> str:
     if kind in ("KB", "A"):
         return ""
 
-    # ── EE/KB: 경기도 교통정보센터 방식 ──────────
-    # /map/getGyeonggiCctvUrl.do?cctvIp={cctvip}
-    if "EE" in kind or "KB" in kind:
-        url = _call_internal_api(
-            f"{BASE_URL}/map/getGyeonggiCctvUrl.do?cctvIp={cctvip}")
+    # EE/EEE: 경기도 교통정보센터 방식
+    if "EE" in kind:
+        endpoint = (
+            f"{BASE_URL}/map/getGyeonggiCctvUrlFromIts.do?cctvIp={cctvip}"
+            if kind == "EEE"
+            else f"{BASE_URL}/map/getGyeonggiCctvUrl.do?cctvIp={cctvip}"
+        )
+        url = _call_internal_api(endpoint)
         if url:
             return url
 
-    # ── EEE: ITS 기반 경기도 ──────────────────────
-    if "EEE" in kind:
-        url = _call_internal_api(
-            f"{BASE_URL}/map/getGyeonggiCctvUrlFromIts.do?cctvIp={cctvip}")
-        if url:
-            return url
-
-    # ── 기타: 팝업 HTML에서 직접 추출 ─────────────
+    # 기타: 팝업 HTML에서 추출
     return _fetch_from_popup(cctv_id, kind, cctvip, name)
 
 
-def _call_internal_api(url: str) -> str:
-    """UTIC 내부 API 호출 → 스트림 URL 반환"""
-    try:
-        resp = requests.get(url, headers=HEADERS_AJAX, timeout=8)
-        if resp.status_code != 200:
-            return ""
-        text = resp.text.strip()
-        # "null" 또는 빈값이면 스킵
-        if not text or text == "null" or text == '"null"':
-            return ""
-        # JSON 문자열인 경우 파싱
-        import json
-        try:
-            parsed = json.loads(text)
-            if isinstance(parsed, str):
-                return parsed if parsed.startswith("http") else ""
-            if isinstance(parsed, dict):
-                for key in ["url", "cctvurl", "streamUrl", "data"]:
-                    val = parsed.get(key, "")
-                    if val and str(val).startswith("http"):
-                        return str(val)
-        except Exception:
-            # 순수 URL 문자열인 경우
-            if text.startswith("http"):
-                return text
-        return ""
-    except Exception:
-        return ""
-
-
 def _fetch_from_popup(cctv_id, kind, cctvip, name="") -> str:
-    """팝업 JSP HTML에서 스트림 URL 추출"""
     try:
         popup_url = (
             f"{BASE_URL}/jsp/map/openDataCctvStream.jsp"
@@ -125,20 +134,20 @@ def _fetch_from_popup(cctv_id, kind, cctvip, name="") -> str:
         if resp.status_code != 200:
             return ""
         html = resp.text
-
         patterns = [
             r'(https?://cctvsec\.ktict\.co\.kr[^\s\'"<>\\]+)',
+            r'(//cctvsec\.ktict\.co\.kr[^\s\'"<>\\]+)',
             r'(https?://[^\s\'"<>\\]+\.m3u8[^\s\'"<>\\]*)',
             r'(https?://[^\s\'"<>\\]+\.mp4[^\s\'"<>\\]*)',
         ]
         for pat in patterns:
             for m in re.findall(pat, html, re.IGNORECASE):
-                if "undefined" not in m and len(m) > 20:
-                    return m
+                normalized = _normalize_url(m)
+                if normalized and "undefined" not in normalized:
+                    return normalized
         return ""
     except Exception:
         return ""
-
 
 # ──────────────────────────────────────────────
 # 단일 CCTV 스트림 URL 조회
@@ -163,7 +172,6 @@ def utic_info():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 # ──────────────────────────────────────────────
 # 내부 API 직접 테스트
 # GET /utic/api?cctvIp=62086
@@ -172,22 +180,21 @@ def utic_info():
 def utic_api():
     cctvip = request.args.get("cctvIp", "62086")
     results = {}
-
     for endpoint in [
         f"{BASE_URL}/map/getGyeonggiCctvUrl.do?cctvIp={cctvip}",
         f"{BASE_URL}/map/getGyeonggiCctvUrlFromIts.do?cctvIp={cctvip}",
     ]:
         try:
             resp = requests.get(endpoint, headers=HEADERS_AJAX, timeout=8)
+            raw  = resp.text.strip()
             results[endpoint] = {
-                "status": resp.status_code,
-                "body":   resp.text[:500],
+                "status":     resp.status_code,
+                "body":       raw[:500],
+                "normalized": _normalize_url(raw),
             }
         except Exception as e:
             results[endpoint] = {"error": str(e)}
-
     return jsonify(results)
-
 
 # ──────────────────────────────────────────────
 # 크롤러
@@ -240,7 +247,6 @@ def crawl_start():
         "check": "https://nowmoment.onrender.com/crawl/status",
     })
 
-
 @app.route("/crawl/status")
 def crawl_status():
     return jsonify({
@@ -249,11 +255,9 @@ def crawl_status():
         "progress": f"{_crawl_status['done']}/{_crawl_status['total']}",
     })
 
-
 @app.route("/crawl/result")
 def crawl_result():
     return jsonify({"count": len(_stream_cache), "streams": _stream_cache})
-
 
 # ──────────────────────────────────────────────
 # 앱 엔드포인트
