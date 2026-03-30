@@ -1,5 +1,6 @@
 from flask import Flask, jsonify, request, Response
 import requests
+import re
 import json
 
 app = Flask(__name__)
@@ -16,12 +17,9 @@ HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
 }
 
-# ──────────────────────────────────────────────
-# 헬스체크
-# ──────────────────────────────────────────────
 @app.route("/")
 def health():
-    return jsonify({"status": "ok", "service": "UTIC CCTV Proxy v4"})
+    return jsonify({"status": "ok", "service": "UTIC CCTV Proxy v5"})
 
 @app.route("/myip")
 def myip():
@@ -32,26 +30,116 @@ def myip():
         return jsonify({"error": str(e)}), 500
 
 # ──────────────────────────────────────────────
-# KBS 스트림 URL 패턴 테스트
-# KIND=KB, STRMID=L933092 기준으로 알려진 패턴 시도
-# GET /kbs/test?strmId=L933092
+# JS 전체에서 KB/KBS 관련 함수 찾기
 # ──────────────────────────────────────────────
-@app.route("/kbs/test")
-def kbs_test():
-    strm_id = request.args.get("strmId", "L933092")
+@app.route("/utic/kb_full")
+def kb_full():
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/js/openDataCctvStream.js",
+            headers=HEADERS, timeout=10
+        )
+        text = resp.text
 
-    # KBS 재난포털 CCTV 스트림 URL 후보 패턴들
+        # KB 또는 cctvPlay_K 함수 주변 코드 추출
+        # 함수 이름 패턴: cctvPlay_KB, cctvPlay_K, KIND == 'KB'
+        patterns = [
+            r'KB',
+            r'cctvPlay_K[B]?',
+            r"KIND.*KB",
+            r"'KB'",
+            r'"KB"',
+            r'kbs',
+            r'KBS',
+            r'disaster',
+            r'news\.kbs',
+        ]
+
+        found = {}
+        for pat in patterns:
+            matches = [(m.start(), text[max(0,m.start()-100):m.start()+300])
+                      for m in re.finditer(pat, text, re.IGNORECASE)]
+            if matches:
+                found[pat] = [m[1] for m in matches[:5]]
+
+        # cctvPlay_ 함수 목록 전체 추출
+        play_funcs = re.findall(
+            r'this\.cctvPlay_(\w+)\s*=\s*function', text)
+
+        return jsonify({
+            "play_functions": play_funcs,
+            "kb_matches":     found,
+            "js_length":      len(text),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ──────────────────────────────────────────────
+# UTIC 팝업 페이지에서 실제 스트림 URL 추출
+# CCTV 클릭 시 열리는 팝업 페이지 분석
+# ──────────────────────────────────────────────
+@app.route("/utic/popup")
+def utic_popup():
+    cctv_id = request.args.get("cctvId", "L933092")
+
+    popup_urls = [
+        f"{BASE_URL}/map/popupCctvStream.do?cctvId={cctv_id}",
+        f"{BASE_URL}/map/cctvPopup.do?cctvId={cctv_id}",
+        f"{BASE_URL}/guide/cctvStream.do?cctvId={cctv_id}&key={UTIC_KEY}",
+        f"{BASE_URL}/guide/popupCctv.do?cctvId={cctv_id}&key={UTIC_KEY}",
+    ]
+
+    results = []
+    for url in popup_urls:
+        try:
+            resp = requests.get(url, headers={
+                **HEADERS, "Accept": "text/html"}, timeout=8)
+            # URL이나 스트림 관련 내용 추출
+            body = resp.text
+            urls_in_body = re.findall(
+                r'(?:http[s]?://[^\s\'"<>]+(?:m3u8|rtmp|rtsp|stream)[^\s\'"<>]*)',
+                body, re.IGNORECASE)
+            results.append({
+                "url":          url,
+                "status":       resp.status_code,
+                "ct":           resp.headers.get("Content-Type",""),
+                "stream_urls":  urls_in_body,
+                "body_preview": body[:400],
+            })
+        except Exception as e:
+            results.append({"url": url, "error": str(e)})
+
+    return jsonify(results)
+
+# ──────────────────────────────────────────────
+# KBS 재난포털 CCTV 스트림 직접 테스트
+# STRMID와 CCTVIP(포트)로 다양한 패턴 시도
+# ──────────────────────────────────────────────
+@app.route("/kbs/probe")
+def kbs_probe():
+    strm_id = request.args.get("strmId", "L933092")
+    port    = request.args.get("port",   "9983")    # CCTVIP 값
+
+    # KBS 재난포털이 사용하는 알려진 스트리밍 서버들
     candidates = [
-        f"http://d2bq2d93iuuv2a.cloudfront.net/cctv/{strm_id}/{strm_id}.m3u8",
-        f"http://d2bq2d93iuuv2a.cloudfront.net/live/{strm_id}.m3u8",
-        f"https://d2bq2d93iuuv2a.cloudfront.net/cctv/{strm_id}/{strm_id}.m3u8",
-        f"http://news.kbs.co.kr/cctv/{strm_id}.m3u8",
-        f"http://kbs-cctv.stream.co.kr/{strm_id}.m3u8",
-        f"http://www.utic.go.kr/cctv/stream/{strm_id}.m3u8",
+        # KBS CDN 패턴
+        f"https://news.kbs.co.kr/special/emergency/2020/earthquake/cctv/{strm_id}.m3u8",
+        f"http://cctv.kbs.co.kr/stream/{strm_id}.m3u8",
+        f"http://kbscctv.kbs.co.kr/{strm_id}/{strm_id}.m3u8",
+        # 포트 기반 패턴
+        f"rtmp://streaming.kbs.co.kr:{port}/live/{strm_id}",
+        # UTIC 자체 스트리밍
+        f"http://streaming.utic.go.kr/live/{strm_id}.m3u8",
+        f"http://stream.utic.go.kr/{strm_id}.m3u8",
+        # 공공 재난 스트리밍
+        f"http://cctv.safekorea.go.kr/stream/{strm_id}.m3u8",
     ]
 
     results = []
     for url in candidates:
+        if url.startswith("rtmp"):
+            results.append({"url": url, "note": "RTMP - 앱에서 미지원"})
+            continue
         try:
             resp = requests.head(url, timeout=5, allow_redirects=True)
             results.append({
@@ -60,74 +148,17 @@ def kbs_test():
                 "ct":     resp.headers.get("Content-Type", ""),
             })
         except Exception as e:
-            results.append({"url": url, "error": str(e)})
+            results.append({"url": url, "error": str(e[:100])})
 
-    return jsonify({"strmId": strm_id, "candidates": results})
-
-# ──────────────────────────────────────────────
-# UTIC 페이지에서 실제 스트림 URL 추출
-# UTIC이 KBS CCTV 클릭시 호출하는 실제 URL 탐색
-# GET /utic/stream_url?cctvId=L933092
-# ──────────────────────────────────────────────
-@app.route("/utic/stream_url")
-def utic_stream_url():
-    cctv_id = request.args.get("cctvId", "L933092")
-
-    # UTIC이 CCTV 스트림을 위해 호출할 수 있는 엔드포인트 후보
-    endpoints = [
-        f"{BASE_URL}/map/getCctvStreamUrl.do?cctvId={cctv_id}",
-        f"{BASE_URL}/map/getCctvUrl.do?cctvId={cctv_id}",
-        f"{BASE_URL}/cctv/getStreamUrl.do?cctvId={cctv_id}",
-        f"{BASE_URL}/map/cctvStream.do?cctvId={cctv_id}",
-        f"{BASE_URL}/guide/getCctvStream.do?cctvId={cctv_id}&key={UTIC_KEY}",
-    ]
-
-    results = []
-    for url in endpoints:
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=8)
-            results.append({
-                "url":    url,
-                "status": resp.status_code,
-                "ct":     resp.headers.get("Content-Type", ""),
-                "body":   resp.text[:300],
-            })
-        except Exception as e:
-            results.append({"url": url, "error": str(e)})
-
-    return jsonify(results)
+    return jsonify({"strmId": strm_id, "port": port, "results": results})
 
 # ──────────────────────────────────────────────
-# UTIC 앱 JS에서 KBS 스트림 URL 구성 방식 확인
-# GET /utic/kbs_js
+# 앱에서 사용할 최종 CCTV 엔드포인트
+# 위경도 기반으로 CCTV 목록 + 스트림 URL 반환
+# GET /api/cctv?lat=37.53&lng=126.92
 # ──────────────────────────────────────────────
-@app.route("/utic/kbs_js")
-def utic_kbs_js():
-    try:
-        resp = requests.get(
-            f"{BASE_URL}/js/openDataCctvStream.js",
-            headers=HEADERS, timeout=10
-        )
-        # KB 관련 코드만 추출
-        text = resp.text
-        lines = text.split('\n')
-        kb_lines = [l for l in lines if 'KB' in l or 'kbs' in l.lower()
-                    or 'stream' in l.lower() or 'm3u8' in l.lower()
-                    or 'rtmp' in l.lower() or 'http' in l]
-        return jsonify({
-            "kb_related_lines": kb_lines[:50],
-            "full_js_length": len(text),
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# ──────────────────────────────────────────────
-# 위경도 기반 근처 CCTV 조회 + 스트림 URL 포함
-# (앱에서 최종 사용할 엔드포인트)
-# GET /cctv?lat=37.53&lng=126.92&radius=5
-# ──────────────────────────────────────────────
-@app.route("/cctv")
-def cctv():
+@app.route("/api/cctv")
+def api_cctv():
     try:
         lat    = float(request.args.get("lat", 0))
         lng    = float(request.args.get("lng", 0))
@@ -136,18 +167,9 @@ def cctv():
         if lat == 0 or lng == 0:
             return jsonify({"error": "lat, lng 파라미터 필요"}), 400
 
-        # UTIC 전체 목록에서 반경 내 필터링
-        resp = requests.get(
-            f"{BASE_URL}/guide/cctvOpenData.do",
-            params={"key": UTIC_KEY},
-            headers={**HEADERS, "Accept": "text/html"},
-            timeout=20
-        )
-
         return jsonify({
-            "status":  resp.status_code,
-            "message": "UTIC HTML 페이지 반환 - REST API 미지원",
-            "next":    "CCTVID 기반으로 개별 스트림 URL 조회 필요",
+            "status":  "준비중",
+            "message": "스트림 URL 패턴 확인 후 구현 예정",
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
