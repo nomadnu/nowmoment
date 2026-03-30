@@ -1,10 +1,9 @@
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request
 import requests
 import re
-import json
 import threading
 import time
-import os
+import math
 
 app = Flask(__name__)
 
@@ -20,14 +19,13 @@ HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
 }
 
-# ── 수집된 스트림 URL 캐시 (메모리) ──────────────
-# { cctvId: { url, kind, name, lat, lng } }
+# ── 메모리 캐시 ──────────────────────────────
 _stream_cache = {}
 _crawl_status = {
-    "running":   False,
-    "total":     0,
-    "done":      0,
-    "found":     0,
+    "running":    False,
+    "total":      0,
+    "done":       0,
+    "found":      0,
     "started_at": None,
 }
 
@@ -38,8 +36,9 @@ _crawl_status = {
 def health():
     return jsonify({
         "status":  "ok",
-        "service": "UTIC CCTV Proxy v7",
+        "service": "UTIC CCTV Proxy v8",
         "cached":  len(_stream_cache),
+        "crawl":   _crawl_status,
     })
 
 @app.route("/myip")
@@ -51,104 +50,60 @@ def myip():
         return jsonify({"error": str(e)}), 500
 
 # ──────────────────────────────────────────────
-# CCTV ID → 스트림 URL 추출
-# KIND별로 스트림 URL 패턴 적용
+# 팝업 HTML에서 스트림 URL 추출
 # ──────────────────────────────────────────────
-def get_stream_url(cctv_data: dict) -> str:
-    kind    = cctv_data.get("KIND", "")
-    cctvip  = str(cctv_data.get("CCTVIP", ""))
-    strm_id = cctv_data.get("STRMID", "")
-    cctv_id = cctv_data.get("CCTVID", "")
-    movie   = cctv_data.get("MOVIE", "N")
-    center  = cctv_data.get("CENTERNAME", "")
-
-    if movie != "Y":
-        return ""
-
-    # ── 지역별/KIND별 스트림 URL 패턴 ──────────────
-    # 새로운 패턴 발견 시 여기에 추가
-
-    # 서울 (KIND=A: smartway.seoul.go.kr ASX → HLS 변환 불가)
-    if kind == "A":
-        return ""
-
-    # 강릉시 (KIND=EE: streamlock.net HLS)
-    # 확인: cctv20.stream → CCTVIP 62086 (매핑 필요)
-    # → 팝업 HTML에서 직접 추출 시도
-    if kind == "EE" or "강릉" in center:
-        return _fetch_popup_stream(cctv_id)
-
-    # 국도/고속도로 (ITS API로 처리 → 여기선 빈값)
-    if kind in ("N", "H"):
-        return ""
-
-    # KBS 재난포털 (KIND=KB: 전용 플레이어)
-    if kind == "KB":
-        return ""
-
-    # 기타 → 팝업 HTML에서 HLS URL 추출 시도
-    url = _fetch_popup_stream(cctv_id)
-    return url
-
-
 def _fetch_popup_stream(cctv_id: str) -> str:
-    """팝업 페이지 HTML에서 m3u8/rtmp URL 추출"""
-    try:
-        # UTIC 팝업 페이지 직접 요청
-        popup_endpoints = [
-            f"{BASE_URL}/map/openDataCctvStream.do?cctvId={cctv_id}&key={UTIC_KEY}",
-            f"{BASE_URL}/map/cctvStream.do?cctvId={cctv_id}",
-        ]
-
-        for ep in popup_endpoints:
-            try:
-                resp = requests.get(
-                    ep,
-                    headers={**HEADERS, "Accept": "text/html"},
-                    timeout=8
-                )
-                if resp.status_code != 200:
-                    continue
-
-                html = resp.text
-
-                # HLS URL 패턴 찾기
-                patterns = [
-                    r'(https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*)',
-                    r'(https?://[^\s\'"<>]+playlist\.m3u8[^\s\'"<>]*)',
-                    r'file[=:]\s*["\']?(https?://[^\s\'"<>&]+)',
-                    r'src[=:]\s*["\']?(https?://[^\s\'"<>&]+\.m3u8)',
-                    r'streamer[=:]["\']?(rtmp://[^\s\'"<>&]+)',
-                ]
-
-                for pat in patterns:
-                    matches = re.findall(pat, html, re.IGNORECASE)
-                    if matches:
-                        # rtmp는 모바일 미지원
-                        for m in matches:
-                            if m.startswith("http") and (
-                                "m3u8" in m or "stream" in m):
-                                return m
-            except Exception:
+    endpoints = [
+        f"{BASE_URL}/map/openDataCctvStream.do?cctvId={cctv_id}&key={UTIC_KEY}",
+        f"{BASE_URL}/map/cctvStream.do?cctvId={cctv_id}",
+    ]
+    for ep in endpoints:
+        try:
+            resp = requests.get(
+                ep,
+                headers={**HEADERS, "Accept": "text/html"},
+                timeout=8
+            )
+            if resp.status_code != 200:
                 continue
+            html = resp.text
+            patterns = [
+                r'(https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*)',
+                r'file[=:]\s*["\']?(https?://[^\s\'"<>&]+)',
+                r'src[=:]\s*["\']?(https?://[^\s\'"<>&]+\.m3u8)',
+            ]
+            for pat in patterns:
+                for m in re.findall(pat, html, re.IGNORECASE):
+                    if m.startswith("http") and (
+                            "m3u8" in m or "stream" in m):
+                        return m
+        except Exception:
+            continue
+    return ""
 
+def get_stream_url(data: dict) -> str:
+    if data.get("MOVIE") != "Y":
         return ""
-    except Exception:
+    kind    = data.get("KIND", "")
+    cctv_id = data.get("CCTVID", "")
+    # KB(KBS 재난포털), A(서울 ASX), N/H(ITS) 는 스킵
+    if kind in ("KB", "A", "N", "H"):
         return ""
-
+    return _fetch_popup_stream(cctv_id)
 
 # ──────────────────────────────────────────────
-# 크롤러 실행 (백그라운드 스레드)
-# CCTV ID 목록을 순회하며 스트림 URL 수집
+# 크롤러 백그라운드 작업
 # ──────────────────────────────────────────────
 def _crawl_worker(cctv_ids: list):
-    global _stream_cache, _crawl_status
+    global _crawl_status
 
-    _crawl_status["running"]    = True
-    _crawl_status["total"]      = len(cctv_ids)
-    _crawl_status["done"]       = 0
-    _crawl_status["found"]      = 0
-    _crawl_status["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    _crawl_status.update({
+        "running":    True,
+        "total":      len(cctv_ids),
+        "done":       0,
+        "found":      0,
+        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    })
 
     for cctv_id in cctv_ids:
         try:
@@ -159,44 +114,46 @@ def _crawl_worker(cctv_ids: list):
                 timeout=8
             )
             data = resp.json()
+            url  = get_stream_url(data)
 
-            if data.get("MOVIE") == "Y":
-                url = get_stream_url(data)
-                if url:
-                    _stream_cache[cctv_id] = {
-                        "url":    url,
-                        "kind":   data.get("KIND", ""),
-                        "name":   data.get("CCTVNAME", ""),
-                        "lat":    data.get("YCOORD", 0),
-                        "lng":    data.get("XCOORD", 0),
-                        "center": data.get("CENTERNAME", ""),
-                    }
-                    _crawl_status["found"] += 1
-
+            if url:
+                _stream_cache[cctv_id] = {
+                    "url":    url,
+                    "kind":   data.get("KIND", ""),
+                    "name":   data.get("CCTVNAME", ""),
+                    "lat":    data.get("YCOORD", 0),
+                    "lng":    data.get("XCOORD", 0),
+                    "center": data.get("CENTERNAME", ""),
+                }
+                _crawl_status["found"] += 1
         except Exception:
             pass
 
         _crawl_status["done"] += 1
-        # 서버 부하 방지 (0.2초 간격)
-        time.sleep(0.2)
+        time.sleep(0.3)  # 서버 부하 방지
 
     _crawl_status["running"] = False
 
-
 # ──────────────────────────────────────────────
-# 크롤러 시작
-# POST /crawl/start  body: {"ids": ["L904028", ...]}
+# 크롤링 시작 (GET 방식 — 브라우저에서 바로 실행)
+# GET /crawl/start?ids=L904028,L904029,L904030
 # ──────────────────────────────────────────────
-@app.route("/crawl/start", methods=["POST"])
+@app.route("/crawl/start")
 def crawl_start():
     if _crawl_status["running"]:
-        return jsonify({"error": "이미 크롤링 중"}), 400
+        return jsonify({
+            "error":  "이미 크롤링 중",
+            "status": _crawl_status,
+        }), 400
 
-    body     = request.get_json(force=True, silent=True) or {}
-    cctv_ids = body.get("ids", [])
+    ids_str  = request.args.get("ids", "")
+    cctv_ids = [i.strip() for i in ids_str.split(",") if i.strip()]
 
     if not cctv_ids:
-        return jsonify({"error": "ids 목록 필요"}), 400
+        return jsonify({
+            "error":   "ids 파라미터 필요",
+            "example": "/crawl/start?ids=L904028,L904029,L904030",
+        }), 400
 
     t = threading.Thread(
         target=_crawl_worker,
@@ -206,13 +163,14 @@ def crawl_start():
     t.start()
 
     return jsonify({
-        "status":  "started",
+        "status":  "시작됨",
         "total":   len(cctv_ids),
-        "message": "/crawl/status 에서 진행상황 확인",
+        "message": "아래 URL에서 진행상황을 확인하세요",
+        "check":   "https://nowmoment.onrender.com/crawl/status",
     })
 
 # ──────────────────────────────────────────────
-# 크롤링 진행 상황
+# 진행 상황 확인
 # GET /crawl/status
 # ──────────────────────────────────────────────
 @app.route("/crawl/status")
@@ -220,10 +178,11 @@ def crawl_status():
     return jsonify({
         **_crawl_status,
         "cached_count": len(_stream_cache),
+        "progress":     f"{_crawl_status['done']}/{_crawl_status['total']}",
     })
 
 # ──────────────────────────────────────────────
-# 수집된 스트림 URL 전체 조회
+# 수집 결과 확인
 # GET /crawl/result
 # ──────────────────────────────────────────────
 @app.route("/crawl/result")
@@ -234,8 +193,7 @@ def crawl_result():
     })
 
 # ──────────────────────────────────────────────
-# 앱에서 사용할 최종 엔드포인트
-# 위경도 기반 근처 CCTV + 스트림 URL 반환
+# 앱에서 사용할 엔드포인트
 # GET /api/cctv?lat=37.79&lng=128.89&radius=5
 # ──────────────────────────────────────────────
 @app.route("/api/cctv")
@@ -248,22 +206,19 @@ def api_cctv():
         if lat == 0 or lng == 0:
             return jsonify({"error": "lat, lng 파라미터 필요"}), 400
 
-        import math
-        def dist_km(lat1, lng1, lat2, lng2):
-            R = 6371
-            dlat = math.radians(lat2 - lat1)
-            dlng = math.radians(lng2 - lng1)
-            a = (math.sin(dlat/2)**2 +
-                 math.cos(math.radians(lat1)) *
-                 math.cos(math.radians(lat2)) *
-                 math.sin(dlng/2)**2)
+        def dist_km(la1, ln1, la2, ln2):
+            R    = 6371
+            dlat = math.radians(la2 - la1)
+            dlng = math.radians(ln2 - ln1)
+            a    = (math.sin(dlat/2)**2 +
+                    math.cos(math.radians(la1)) *
+                    math.cos(math.radians(la2)) *
+                    math.sin(dlng/2)**2)
             return R * 2 * math.asin(math.sqrt(a))
 
         nearby = []
         for cctv_id, info in _stream_cache.items():
-            d = dist_km(lat, lng,
-                        info.get("lat", 0),
-                        info.get("lng", 0))
+            d = dist_km(lat, lng, info.get("lat", 0), info.get("lng", 0))
             if d <= radius:
                 nearby.append({
                     "cctvId":    cctv_id,
@@ -277,16 +232,13 @@ def api_cctv():
                 })
 
         nearby.sort(key=lambda x: x["distKm"])
-        return jsonify({
-            "count": len(nearby),
-            "items": nearby[:20],
-        })
+        return jsonify({"count": len(nearby), "items": nearby[:20]})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ──────────────────────────────────────────────
-# 단일 CCTV 스트림 URL 조회
+# 단일 CCTV 정보 + 스트림 URL 조회
 # GET /utic/info?cctvId=L904028
 # ──────────────────────────────────────────────
 @app.route("/utic/info")
@@ -298,8 +250,7 @@ def utic_info():
         resp = requests.get(
             f"{BASE_URL}/map/getCctvInfoById.do",
             params={"cctvId": cctv_id},
-            headers=HEADERS,
-            timeout=10
+            headers=HEADERS, timeout=10
         )
         data = resp.json()
         url  = get_stream_url(data)
