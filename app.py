@@ -176,5 +176,31 @@ def streams():
 
     return jsonify({"count": len(results), "items": results})
 
+# ──────────────────────────────────────────────
+# 단일 CCTV 정보 + 스트림 URL 조회 (디버깅용)
+# GET /utic/info?cctvId=E620016
+# ──────────────────────────────────────────────
+@app.route("/utic/info")
+def utic_info():
+    cctv_id = request.args.get("cctvId", "")
+    if not cctv_id:
+        return jsonify({"error": "cctvId 파라미터 필요"}), 400
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/map/getCctvInfoById.do",
+            params={"cctvId": cctv_id},
+            headers=HEADERS_AJAX, timeout=10
+        )
+        data = resp.json()
+        url  = get_stream_url(data)
+        return jsonify({
+            "cctvId":    cctv_id,
+            "data":      data,
+            "streamUrl": url,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
