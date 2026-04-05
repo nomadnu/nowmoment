@@ -8,8 +8,6 @@ import json
 import csv
 import os
 
-from apscheduler.schedulers.background import BackgroundScheduler
-
 app = Flask(__name__)
 
 UTIC_KEY = "ZVLJkMXJRVVi9UMJoSlmD3cH9D6vS2FYihW68QH2JDM"
@@ -28,9 +26,13 @@ HEADERS_AJAX = {
     "X-Requested-With": "XMLHttpRequest",
 }
 
-# ── 전역 상태 ──────────────────────────────────
-_stream_cache = {}          # { cctvId: {url, kind, name, lat, lng, center} }
-_crawl_lock   = threading.Lock()
+# ── 파일 경로 ─────────────────────────────────
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+CACHE_FILE = os.path.join(BASE_DIR, "stream_cache.json")
+CSV_FILE   = os.path.join(BASE_DIR, "OpenDataCCTV.csv")
+
+# ── 전역 상태 ─────────────────────────────────
+_stream_cache = {}
 _crawl_status = {
     "running":      False,
     "total":        0,
@@ -38,32 +40,53 @@ _crawl_status = {
     "found":        0,
     "started_at":   None,
     "finished_at":  None,
-    "next_refresh": None,
+    "batch":        "",
 }
 
 # ──────────────────────────────────────────────
-# CSV에서 CCTV ID 목록 로드
-# GitHub 저장소에 OpenDataCCTV.csv 파일 필요
+# 캐시 파일 저장/로드
 # ──────────────────────────────────────────────
-def load_cctv_ids_from_csv() -> list:
-    csv_path = os.path.join(os.path.dirname(__file__), "OpenDataCCTV.csv")
-    if not os.path.exists(csv_path):
-        print(f"⚠️ CSV 파일 없음: {csv_path}")
-        return []
+def save_cache():
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_stream_cache, f, ensure_ascii=False)
+        print(f"💾 캐시 저장: {len(_stream_cache)}개")
+    except Exception as e:
+        print(f"❌ 캐시 저장 실패: {e}")
 
+def load_cache():
+    global _stream_cache
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, encoding="utf-8") as f:
+                _stream_cache = json.load(f)
+            print(f"✅ 캐시 로드: {len(_stream_cache)}개")
+        except Exception as e:
+            print(f"❌ 캐시 로드 실패: {e}")
+            _stream_cache = {}
+
+# 서버 시작 시 캐시 로드
+load_cache()
+
+# ──────────────────────────────────────────────
+# CSV에서 CCTV ID 로드
+# ──────────────────────────────────────────────
+def load_cctv_ids() -> list:
+    if not os.path.exists(CSV_FILE):
+        print(f"⚠️ CSV 없음: {CSV_FILE}")
+        return []
     ids = []
     try:
-        with open(csv_path, encoding="utf-8") as f:
+        with open(CSV_FILE, encoding="utf-8") as f:
             reader = csv.reader(f)
-            next(reader)  # 헤더 스킵
+            next(reader)
             for row in reader:
                 if len(row) >= 2 and row[1].strip():
                     ids.append(row[1].strip())
-        print(f"✅ CSV 로드 완료: {len(ids)}개 CCTV ID")
+        print(f"✅ CSV 로드: {len(ids)}개")
     except Exception as e:
         print(f"❌ CSV 로드 실패: {e}")
     return ids
-
 
 # ──────────────────────────────────────────────
 # URL 정규화
@@ -78,10 +101,6 @@ def _normalize_url(raw: str) -> str:
         return ""
     return url
 
-
-# ──────────────────────────────────────────────
-# UTIC 내부 API 호출
-# ──────────────────────────────────────────────
 def _call_internal_api(url: str) -> str:
     try:
         resp = requests.get(url, headers=HEADERS_AJAX, timeout=8)
@@ -96,8 +115,7 @@ def _call_internal_api(url: str) -> str:
                 return _normalize_url(parsed)
             if isinstance(parsed, dict):
                 for key in ["url", "cctvurl", "streamUrl", "data"]:
-                    val = str(parsed.get(key, ""))
-                    n = _normalize_url(val)
+                    n = _normalize_url(str(parsed.get(key, "")))
                     if n:
                         return n
         except Exception:
@@ -106,36 +124,23 @@ def _call_internal_api(url: str) -> str:
     except Exception:
         return ""
 
-
-# ──────────────────────────────────────────────
-# KIND별 스트림 URL 조회
-# ──────────────────────────────────────────────
 def get_stream_url(data: dict) -> str:
     if data.get("MOVIE") != "Y":
         return ""
-
-    kind    = data.get("KIND", "")
-    cctvip  = str(data.get("CCTVIP", ""))
+    kind   = data.get("KIND", "")
+    cctvip = str(data.get("CCTVIP", ""))
     cctv_id = data.get("CCTVID", "")
-    name    = data.get("CCTVNAME", "")
-
+    name   = data.get("CCTVNAME", "")
     if kind in ("KB", "A"):
         return ""
-
-    # EE 계열: 경기도 교통정보센터 방식
     if "EE" in kind:
-        endpoint = (
-            f"{BASE_URL}/map/getGyeonggiCctvUrlFromIts.do?cctvIp={cctvip}"
-            if kind == "EEE"
-            else f"{BASE_URL}/map/getGyeonggiCctvUrl.do?cctvIp={cctvip}"
-        )
-        url = _call_internal_api(endpoint)
+        ep = (f"{BASE_URL}/map/getGyeonggiCctvUrlFromIts.do?cctvIp={cctvip}"
+              if kind == "EEE"
+              else f"{BASE_URL}/map/getGyeonggiCctvUrl.do?cctvIp={cctvip}")
+        url = _call_internal_api(ep)
         if url:
             return url
-
-    # 기타: 팝업 HTML에서 추출
     return _fetch_from_popup(cctv_id, kind, cctvip, name)
-
 
 def _fetch_from_popup(cctv_id, kind, cctvip, name="") -> str:
     try:
@@ -151,13 +156,12 @@ def _fetch_from_popup(cctv_id, kind, cctvip, name="") -> str:
         if resp.status_code != 200:
             return ""
         html = resp.text
-        patterns = [
+        for pat in [
             r'(https?://cctvsec\.ktict\.co\.kr[^\s\'"<>\\]+)',
             r'(//cctvsec\.ktict\.co\.kr[^\s\'"<>\\]+)',
             r'(https?://[^\s\'"<>\\]+\.m3u8[^\s\'"<>\\]*)',
             r'(https?://[^\s\'"<>\\]+\.mp4[^\s\'"<>\\]*)',
-        ]
-        for pat in patterns:
+        ]:
             for m in re.findall(pat, html, re.IGNORECASE):
                 n = _normalize_url(m)
                 if n and "undefined" not in n:
@@ -166,115 +170,76 @@ def _fetch_from_popup(cctv_id, kind, cctvip, name="") -> str:
     except Exception:
         return ""
 
+# ──────────────────────────────────────────────
+# 배치 크롤링 워커
+# 500개씩 나눠서 처리, 각 배치 완료 시 파일 저장
+# ──────────────────────────────────────────────
+BATCH_SIZE = 500
 
-# ──────────────────────────────────────────────
-# 크롤링 워커 (백그라운드)
-# ──────────────────────────────────────────────
 def _crawl_worker(cctv_ids: list):
-    global _stream_cache, _crawl_status
+    global _crawl_status
 
-    with _crawl_lock:
-        if _crawl_status["running"]:
-            return
-
-        _crawl_status.update({
-            "running":     True,
-            "total":       len(cctv_ids),
-            "done":        0,
-            "found":       0,
-            "started_at":  time.strftime("%Y-%m-%d %H:%M:%S"),
-            "finished_at": None,
-        })
-
-    new_cache = {}
-    done  = 0
-    found = 0
-
-    for cctv_id in cctv_ids:
-        try:
-            resp = requests.get(
-                f"{BASE_URL}/map/getCctvInfoById.do",
-                params={"cctvId": cctv_id},
-                headers=HEADERS_AJAX, timeout=8
-            )
-            data = resp.json()
-            url  = get_stream_url(data)
-
-            if url:
-                new_cache[cctv_id] = {
-                    "url":    url,
-                    "kind":   data.get("KIND", ""),
-                    "name":   data.get("CCTVNAME", ""),
-                    "lat":    data.get("YCOORD", 0),
-                    "lng":    data.get("XCOORD", 0),
-                    "center": data.get("CENTERNAME", ""),
-                }
-                found += 1
-        except Exception:
-            pass
-
-        done += 1
-        _crawl_status["done"]  = done
-        _crawl_status["found"] = found
-        time.sleep(0.2)  # 서버 부하 방지
-
-    # 캐시 갱신
-    _stream_cache = new_cache
-
-    next_refresh = time.strftime(
-        "%Y-%m-%d %H:%M:%S",
-        time.localtime(time.time() + 7200)
-    )
     _crawl_status.update({
-        "running":      False,
-        "finished_at":  time.strftime("%Y-%m-%d %H:%M:%S"),
-        "next_refresh": next_refresh,
+        "running":     True,
+        "total":       len(cctv_ids),
+        "done":        0,
+        "found":       len(_stream_cache),  # 기존 캐시 포함
+        "started_at":  time.strftime("%Y-%m-%d %H:%M:%S"),
+        "finished_at": None,
+        "batch":       "",
     })
-    print(f"✅ 크롤링 완료: {found}/{done}개 URL 확보, 다음 갱신: {next_refresh}")
+
+    done = 0
+    for i in range(0, len(cctv_ids), BATCH_SIZE):
+        batch     = cctv_ids[i:i + BATCH_SIZE]
+        batch_num = i // BATCH_SIZE + 1
+        total_batches = (len(cctv_ids) + BATCH_SIZE - 1) // BATCH_SIZE
+        _crawl_status["batch"] = f"{batch_num}/{total_batches}"
+        print(f"🔄 배치 {batch_num}/{total_batches} 시작 ({len(batch)}개)")
+
+        for cctv_id in batch:
+            try:
+                resp = requests.get(
+                    f"{BASE_URL}/map/getCctvInfoById.do",
+                    params={"cctvId": cctv_id},
+                    headers=HEADERS_AJAX, timeout=8
+                )
+                data = resp.json()
+                url  = get_stream_url(data)
+                if url:
+                    _stream_cache[cctv_id] = {
+                        "url":    url,
+                        "kind":   data.get("KIND", ""),
+                        "name":   data.get("CCTVNAME", ""),
+                        "lat":    data.get("YCOORD", 0),
+                        "lng":    data.get("XCOORD", 0),
+                        "center": data.get("CENTERNAME", ""),
+                    }
+                    _crawl_status["found"] += 1
+            except Exception:
+                pass
+
+            done += 1
+            _crawl_status["done"] = done
+            time.sleep(0.15)
+
+        # 배치 완료 시마다 파일 저장 (서버 꺼져도 유지)
+        save_cache()
+        print(f"✅ 배치 {batch_num} 완료, 누적 {len(_stream_cache)}개 저장")
+
+    _crawl_status.update({
+        "running":     False,
+        "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "batch":       "완료",
+    })
+    print(f"🎉 전체 크롤링 완료: {len(_stream_cache)}개")
 
 
-def start_crawl_async(cctv_ids: list):
-    t = threading.Thread(target=_crawl_worker, args=(cctv_ids,), daemon=True)
-    t.start()
-
-
-# ──────────────────────────────────────────────
-# 2시간마다 자동 갱신 스케줄러
-# ──────────────────────────────────────────────
-def scheduled_refresh():
-    print("🔄 스케줄 갱신 시작...")
-    ids = load_cctv_ids_from_csv()
-    if ids:
-        start_crawl_async(ids)
-    else:
-        print("⚠️ CSV 없음 - 갱신 스킵")
-
-
-scheduler = BackgroundScheduler()
-scheduler.add_job(scheduled_refresh, "interval", hours=2, id="refresh")
-scheduler.start()
-
-# 앱 시작 시 초기 크롤링
-def initial_crawl():
-    time.sleep(3)  # 서버 완전 기동 후 시작
-    ids = load_cctv_ids_from_csv()
-    if ids:
-        print(f"🚀 초기 크롤링 시작: {len(ids)}개")
-        start_crawl_async(ids)
-    else:
-        print("⚠️ CSV 없음 - 초기 크롤링 스킵")
-
-threading.Thread(target=initial_crawl, daemon=True).start()
-
-
-# ──────────────────────────────────────────────
-# API 엔드포인트
-# ──────────────────────────────────────────────
 @app.route("/")
 def health():
     return jsonify({
         "status":  "ok",
-        "service": "UTIC CCTV Proxy v13",
+        "service": "UTIC CCTV Proxy v14",
         "cached":  len(_stream_cache),
         "crawl":   _crawl_status,
     })
@@ -287,30 +252,37 @@ def myip():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/crawl/start")
+def crawl_start():
+    if _crawl_status["running"]:
+        return jsonify({"error": "이미 크롤링 중", "status": _crawl_status}), 400
+
+    ids_str  = request.args.get("ids", "")
+    if ids_str:
+        cctv_ids = [i.strip() for i in ids_str.split(",") if i.strip()]
+    else:
+        cctv_ids = load_cctv_ids()
+
+    if not cctv_ids:
+        return jsonify({"error": "ids 없음"}), 400
+
+    t = threading.Thread(target=_crawl_worker, args=(cctv_ids,), daemon=True)
+    t.start()
+
+    return jsonify({
+        "status":     "시작됨",
+        "total":      len(cctv_ids),
+        "batch_size": BATCH_SIZE,
+        "note":       "500개마다 파일 저장 → 서버 재시작 시 복원됨",
+        "check":      "https://nowmoment.onrender.com/crawl/status",
+    })
+
 @app.route("/crawl/status")
 def crawl_status():
     return jsonify({
         **_crawl_status,
         "cached_count": len(_stream_cache),
         "progress":     f"{_crawl_status['done']}/{_crawl_status['total']}",
-    })
-
-@app.route("/crawl/start")
-def crawl_start():
-    if _crawl_status["running"]:
-        return jsonify({"error": "이미 크롤링 중", "status": _crawl_status}), 400
-    ids_str  = request.args.get("ids", "")
-    if ids_str:
-        cctv_ids = [i.strip() for i in ids_str.split(",") if i.strip()]
-    else:
-        cctv_ids = load_cctv_ids_from_csv()
-    if not cctv_ids:
-        return jsonify({"error": "ids 없음 (CSV 파일 또는 ids 파라미터 필요)"}), 400
-    start_crawl_async(cctv_ids)
-    return jsonify({
-        "status": "시작됨",
-        "total":  len(cctv_ids),
-        "check":  "https://nowmoment.onrender.com/crawl/status",
     })
 
 @app.route("/crawl/result")
@@ -336,7 +308,7 @@ def utic_info():
 
 @app.route("/utic/api")
 def utic_api():
-    cctvip  = request.args.get("cctvIp", "62086")
+    cctvip = request.args.get("cctvIp", "62086")
     results = {}
     for ep in [
         f"{BASE_URL}/map/getGyeonggiCctvUrl.do?cctvIp={cctvip}",
