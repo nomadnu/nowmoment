@@ -204,3 +204,51 @@ def utic_info():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
+
+# ──────────────────────────────────────────────
+# 팝업 HTML 분석 (디버깅용)
+# GET /utic/popup?cctvId=E620016
+# ──────────────────────────────────────────────
+@app.route("/utic/popup")
+def utic_popup():
+    cctv_id = request.args.get("cctvId", "")
+    if not cctv_id:
+        return jsonify({"error": "cctvId 파라미터 필요"}), 400
+    try:
+        info_resp = requests.get(
+            f"{BASE_URL}/map/getCctvInfoById.do",
+            params={"cctvId": cctv_id},
+            headers=HEADERS_AJAX, timeout=10
+        )
+        data   = info_resp.json()
+        kind   = data.get("KIND", "")
+        cctvip = str(data.get("CCTVIP", ""))
+        name   = data.get("CCTVNAME", "")
+
+        popup_url = (
+            f"{BASE_URL}/jsp/map/openDataCctvStream.jsp"
+            f"?key={UTIC_KEY}&cctvid={cctv_id}"
+            f"&cctvName={requests.utils.quote(name)}"
+            f"&kind={kind}&cctvip={cctvip}"
+            f"&cctvch=undefined&id=undefined"
+            f"&cctvpasswd=undefined&cctvport=undefined"
+        )
+        popup_resp = requests.get(popup_url, headers=HEADERS, timeout=10)
+        html = popup_resp.text
+
+        all_urls = re.findall(r'(https?://[^\s\'"<>\\]+)', html)
+        js_vars  = re.findall(r'var\s+(\w+)\s*=\s*["\']([^"\']+)["\']', html)
+
+        return jsonify({
+            "cctvId":       cctv_id,
+            "kind":         kind,
+            "cctvip":       cctvip,
+            "popup_url":    popup_url,
+            "status":       popup_resp.status_code,
+            "all_urls":     list(set(all_urls))[:20],
+            "js_vars":      js_vars[:20],
+            "html_preview": html[:2000],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
