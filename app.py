@@ -94,13 +94,17 @@ def get_stream_url(data: dict) -> str:
     name    = data.get("CCTVNAME", "")
     if kind in ("KB", "A"):
         return ""
-    if "EE" in kind:
+
+    # EE, EEE, AC 계열: getGyeonggiCctvUrl.do 방식
+    if "EE" in kind or kind == "AC":
         ep = (f"{BASE_URL}/map/getGyeonggiCctvUrlFromIts.do?cctvIp={cctvip}"
               if kind == "EEE"
               else f"{BASE_URL}/map/getGyeonggiCctvUrl.do?cctvIp={cctvip}")
         url = _call_internal_api(ep)
         if url:
             return url
+
+    # 그 외: 팝업 HTML에서 직접 추출
     return _fetch_from_popup(cctv_id, kind, cctvip, name)
 
 # ──────────────────────────────────────────────
@@ -108,7 +112,7 @@ def get_stream_url(data: dict) -> str:
 # ──────────────────────────────────────────────
 @app.route("/")
 def health():
-    return jsonify({"status": "ok", "service": "UTIC CCTV Proxy v15"})
+    return jsonify({"status": "ok", "service": "UTIC CCTV Proxy v16"})
 
 @app.route("/myip")
 def myip():
